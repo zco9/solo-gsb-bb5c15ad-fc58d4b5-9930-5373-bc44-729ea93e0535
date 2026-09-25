@@ -16,6 +16,12 @@
   中线镜像），逐层折回最终折叠面，得到归一化孔心；再用同一展开算法列出
   这一次打孔必然生成的全部孔位。目标孔心距纸张边界/折痕不大于打孔半径时
   拒绝并说明具体原因。
+- 目标孔位排版（/api/plan）：用户按原纸 mm 坐标逐行给出一组目标孔心。
+  逐个目标折回折叠面得到打孔点、再展开为该点的完整连带孔组；折回同一
+  孔心的目标按坐标容差合并。仅当全部连带孔的并集与目标集合逐点相等
+  （不产生目标之外的孔）、打孔点数不超过 MAX_HOLES，且每个目标都通过
+  边界、折痕与保护区校验时，方案才可用；否则指出违规目标及原因，以及
+  缺少的连带孔（必然被打出、却不在目标清单里的孔位）。
 - 全部折痕展开后构成 (2^nv - 1) x (2^nh - 1) 的等分网格。
 - 原纸保护区：原纸上至多 MAX_ZONES 个轴对齐矩形（mm 坐标），绘入展开图。
   任一展开孔圆与任一保护区相交或相切即违规：指出原打孔点、触碰的展开孔
@@ -43,6 +49,8 @@ MAX_DIM = 2000.0        # mm
 MIN_RADIUS = 0.5        # mm
 MAX_RADIUS = 50.0       # mm
 EDGE_TOL = 0.05         # mm，边界判定容差（浮点误差 + 必须严格在内侧）
+PLAN_TOL_MM = 1e-3      # mm，目标孔位排版的坐标容差（目标匹配/孔心去重）
+MAX_TARGETS = 4096      # 目标孔位排版允许的最大目标行数
 
 ALLOWED_FOLDS = ("vL", "vR", "hT", "hB")
 EDGE_NAMES = {
@@ -169,30 +177,35 @@ def check_target_on_paper(tx, ty, width, height, radius, nv, nh):
 
     与折叠面上的 check_point 几何上等价（折叠就是把边界/折痕网格
     折到当前面四边），这里从原纸视角给出更直观的中文原因。
+    返回 (违规类型, 中文原因)；违规类型为 "boundary"（纸张边界）或
+    "crease"（折痕），合法时返回 (None, None)。
     """
     r = radius + EDGE_TOL
     bounds = (("纸张左边界", tx), ("纸张右边界", width - tx),
               ("纸张下边界", ty), ("纸张上边界", height - ty))
     for name, dist in bounds:
         if dist < r:
-            return (f"目标孔心 ({tx:.2f}, {ty:.2f}) 距{name}仅 "
-                    f"{max(dist, 0.0):.2f}mm，小于打孔半径 {radius:g}mm"
-                    "（孔会超出纸张边界），请把目标点移离边界。")
+            return "boundary", (
+                f"目标孔心 ({tx:.2f}, {ty:.2f}) 距{name}仅 "
+                f"{max(dist, 0.0):.2f}mm，小于打孔半径 {radius:g}mm"
+                "（孔会超出纸张边界），请把目标点移离边界。")
     for k in range(1, 2 ** nv):
         pos = width * k / 2 ** nv
         dist = abs(tx - pos)
         if dist < r:
-            return (f"目标孔心 ({tx:.2f}, {ty:.2f}) 距垂直折痕 x={pos:.2f}mm 仅 "
-                    f"{dist:.2f}mm，小于打孔半径 {radius:g}mm"
-                    "（孔会压在折痕上），请把目标点移离折痕。")
+            return "crease", (
+                f"目标孔心 ({tx:.2f}, {ty:.2f}) 距垂直折痕 x={pos:.2f}mm 仅 "
+                f"{dist:.2f}mm，小于打孔半径 {radius:g}mm"
+                "（孔会压在折痕上），请把目标点移离折痕。")
     for k in range(1, 2 ** nh):
         pos = height * k / 2 ** nh
         dist = abs(ty - pos)
         if dist < r:
-            return (f"目标孔心 ({tx:.2f}, {ty:.2f}) 距水平折痕 y={pos:.2f}mm 仅 "
-                    f"{dist:.2f}mm，小于打孔半径 {radius:g}mm"
-                    "（孔会压在折痕上），请把目标点移离折痕。")
-    return None
+            return "crease", (
+                f"目标孔心 ({tx:.2f}, {ty:.2f}) 距水平折痕 y={pos:.2f}mm 仅 "
+                f"{dist:.2f}mm，小于打孔半径 {radius:g}mm"
+                "（孔会压在折痕上），请把目标点移离折痕。")
+    return None, None
 
 
 def crease_grid(width, height, nv, nh):
@@ -531,7 +544,7 @@ def reverse_lookup(payload):
         raise ValueError(zone_bounds_msg(oob, zones[oob], width, height))
 
     # 目标孔心在原纸上的校验（边界 + 全部折痕）
-    err = check_target_on_paper(tx, ty, width, height, radius, nv, nh)
+    _kind, err = check_target_on_paper(tx, ty, width, height, radius, nv, nh)
     if err:
         raise ValueError(err)
 
@@ -568,6 +581,205 @@ def reverse_lookup(payload):
     }
 
 
+def plan_lookup(payload):
+    """目标孔位排版：一组原纸目标孔心 -> 最终折叠面打孔方案。
+
+    每个目标按当前折法折回最终折叠面得到打孔点（折回同一孔心的目标按
+    PLAN_TOL_MM 合并），再用同一展开算法列出该打孔点的完整连带孔组。
+    方案仅在以下条件全部满足时可用（feasible=true）：
+      1. 每个目标都通过纸张边界与全部折痕校验（check_target_on_paper）；
+      2. 折回孔心在折叠面上通过边界/折痕校验（check_point 兜底）；
+      3. 每个连带孔圆都不与任一保护区相交或相切；
+      4. 全部连带孔的并集与目标集合按 PLAN_TOL_MM 逐点完全一致
+         （不能打出目标之外的孔——多出的孔作为"缺少的连带孔"列出）；
+      5. 去重后的打孔点数不超过 MAX_HOLES。
+    其余结构/取值错误（含保护区越出原纸）抛 ValueError（HTTP 400）；
+    方案不可实现返回 200 + feasible=false，并逐条给出原因。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+
+    width, height, radius, folds = _validate_sheet(payload)
+    zones = _validate_zones(payload)
+
+    targets_in = payload.get("targets")
+    if not isinstance(targets_in, list) or not targets_in:
+        raise ValueError("缺少目标孔心列表 targets（原纸 mm 坐标，至少 1 个）")
+    if len(targets_in) > MAX_TARGETS:
+        raise ValueError(f"目标孔心数量须为 1 ~ {MAX_TARGETS} 个")
+    targets = []
+    for i, t in enumerate(targets_in):
+        if not isinstance(t, dict):
+            raise ValueError(f"第 {i + 1} 行目标格式错误，应为 {{x, y}}")
+        tx = _num(t, "x", 0.0, width, f"第 {i + 1} 行目标孔心 x")
+        ty = _num(t, "y", 0.0, height, f"第 {i + 1} 行目标孔心 y")
+        targets.append((tx, ty))
+
+    w, h, edges, nv, nh = folded_state(width, height, folds)
+    _check_face_capacity(w, h, radius)
+
+    # 保护区必须完整位于原纸内
+    oob = zone_out_of_bounds(zones, width, height)
+    if oob is not None:
+        raise ValueError(zone_bounds_msg(oob, zones[oob], width, height))
+
+    # 目标清单按 PLAN_TOL_MM 去重（重复行只计一次）
+    uniq_targets = []
+    for tx, ty in targets:
+        if not any(abs(tx - q[0]) <= PLAN_TOL_MM
+                   and abs(ty - q[1]) <= PLAN_TOL_MM for q in uniq_targets):
+            uniq_targets.append((tx, ty))
+
+    n_images = 2 ** len(folds)
+    # 每个目标：折回孔心、连带孔组（deduped）与校验结果
+    groups = []
+    violations = []                 # 不可实现的逐条原因（按目标行）
+    seen_centers = []               # 去重后的折叠面孔心（mm）
+    for tx, ty in uniq_targets:
+        kind, err = check_target_on_paper(tx, ty, width, height,
+                                          radius, nv, nh)
+        fx = fy = None
+        orbit = []
+        face_kind = None
+        zone_info = None
+        if err is None:
+            fx, fy = fold_point_to_face(tx, ty, folds, width, height)
+            ferr = check_point(fx, fy, w, h, radius, edges)
+            if ferr:
+                face_kind, err = "face", (
+                    f"目标孔心 ({tx:.2f}, {ty:.2f}) 折回折叠面后的{ferr}")
+            else:
+                raw = unfold_points([{"x": fx, "y": fy}], folds, width, height)
+                hit = find_zone_hit(raw, zones, radius, n_images)
+                if hit:
+                    _, hole, zi = hit
+                    zone_info = {"hole": hole, "zoneIndex": zi}
+                    kind = "zone"
+                    err = zone_hit_msg(
+                        f"目标孔心 ({tx:.2f}, {ty:.2f})mm 对应的打孔",
+                        hole["x"], hole["y"], zi, zones[zi], radius)
+                else:
+                    orbit = [(p["x"], p["y"]) for p in dedupe_points(raw)]
+            if not err:
+                if not any(abs(fx - c[0]) <= PLAN_TOL_MM
+                           and abs(fy - c[1]) <= PLAN_TOL_MM for c in seen_centers):
+                    seen_centers.append((fx, fy))
+        if err:
+            violations.append({
+                "kind": face_kind or kind,
+                "target": {"x": round(tx, 6), "y": round(ty, 6)},
+                "message": err,
+                "zoneIndex": zone_info["zoneIndex"] if zone_info else None,
+                "hole": zone_info["hole"] if zone_info else None,
+            })
+        groups.append({
+            "target": (tx, ty),
+            "center": None if fx is None else (fx, fy),
+            "orbit": orbit,
+            "ok": err is None,
+        })
+
+    # 连带孔并集（只统计通过校验的目标）须与目标集合逐点相等。
+    # 并集中不在目标清单里的孔 = 必然被打出、却未要求的"缺少的连带孔"。
+    union = []
+    for g in groups:
+        if not g["ok"]:
+            continue
+        for x, y in g["orbit"]:
+            if not any(abs(x - q[0]) <= PLAN_TOL_MM
+                       and abs(y - q[1]) <= PLAN_TOL_MM for q in union):
+                union.append((x, y))
+
+    def is_target(x, y):
+        return any(abs(x - t[0]) <= PLAN_TOL_MM
+                   and abs(y - t[1]) <= PLAN_TOL_MM for t in uniq_targets)
+
+    extra = []
+    extra_of = []
+    for g in groups:
+        if not g["ok"]:
+            continue
+        tx, ty = g["target"]
+        for x, y in g["orbit"]:
+            if not is_target(x, y) and not any(
+                    abs(x - e[0]) <= PLAN_TOL_MM
+                    and abs(y - e[1]) <= PLAN_TOL_MM for e in extra):
+                extra.append((x, y))
+                extra_of.append((tx, ty, x, y))
+
+    if extra:
+        missing = [{"x": round(x, 6), "y": round(y, 6),
+                    "requiredBy": {"x": round(tx, 6), "y": round(ty, 6)}}
+                   for tx, ty, x, y in extra_of]
+        head = ("目标孔位排版不可实现：以下连带孔会被必然打出，"
+                "但不在目标孔位清单中（需要把它们一并加入目标，"
+                "或调整目标坐标）：")
+        body = "；".join(
+            f"({x:.2f}, {y:.2f})mm（由目标 ({tx:.2f}, {ty:.2f})mm 连带产生）"
+            for tx, ty, x, y in extra_of[:10])
+        if len(extra_of) > 10:
+            body += f"；等共 {len(extra_of)} 个"
+        violations.append({"kind": "missing",
+                           "target": None,
+                           "message": head + body + "。",
+                           "zoneIndex": None, "hole": None,
+                           "missingHoles": missing})
+
+    over_cap = len(seen_centers) > MAX_HOLES
+    feasible = not violations and not over_cap
+
+    error = None
+    if not feasible:
+        parts = []
+        real = [v for v in violations if v["kind"] != "missing"]
+        miss = [v for v in violations if v["kind"] == "missing"]
+        if real:
+            parts.append(f"{len(real)} 个目标违规")
+        if miss:
+            parts.append(f"缺少 {len(miss[0]['missingHoles'])} 个连带孔")
+        if over_cap:
+            parts.append(f"方案需 {len(seen_centers)} 个打孔点，"
+                         f"超过上限 {MAX_HOLES} 个")
+        error = "目标孔位排版不可实现：" + "，".join(parts) + "，详见下方明细。"
+
+    out_groups = []
+    punches = []
+    if feasible:
+        # 每个去重打孔点对应一个组：打孔中心 + 该组覆盖的目标 + 全部连带孔
+        for cx, cy in seen_centers:
+            matched = [g for g in groups
+                       if g["center"] is not None
+                       and abs(g["center"][0] - cx) <= PLAN_TOL_MM
+                       and abs(g["center"][1] - cy) <= PLAN_TOL_MM]
+            orbit = dedupe_points(matched[0]["orbit"], tol=PLAN_TOL_MM)
+            punches.append({"x": round(cx / w, 6), "y": round(cy / h, 6)})
+            out_groups.append({
+                "center": {"x": round(cx / w, 6), "y": round(cy / h, 6)},
+                "centerMm": {"x": round(cx, 6), "y": round(cy, 6)},
+                "targets": [{"x": round(g["target"][0], 6),
+                             "y": round(g["target"][1], 6)} for g in matched],
+                "holes": orbit,
+            })
+
+    return {
+        "ok": True,
+        "feasible": feasible,
+        "error": error,
+        "violations": violations,
+        "targetCount": len(uniq_targets),
+        "duplicateCount": len(targets) - len(uniq_targets),
+        "punchCount": len(seen_centers),
+        "maxHoles": MAX_HOLES,
+        "overCapacity": over_cap,
+        "unfoldedCount": len(union),
+        "punches": punches,
+        "groups": out_groups,
+        "foldedWidth": round(w, 6),
+        "foldedHeight": round(h, 6),
+        "layers": 2 ** len(folds),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 路由
 # ---------------------------------------------------------------------------
@@ -576,6 +788,7 @@ def index():
     return render_template(
         "index.html",
         max_folds=MAX_FOLDS, max_holes=MAX_HOLES, max_zones=MAX_ZONES,
+        max_targets=MAX_TARGETS,
         min_dim=MIN_DIM, max_dim=MAX_DIM,
         min_radius=MIN_RADIUS, max_radius=MAX_RADIUS)
 
@@ -599,6 +812,23 @@ def api_reverse():
         return _bad("请求不是合法 JSON")
     try:
         return jsonify(reverse_lookup(payload))
+    except ValueError as exc:
+        return _bad(str(exc))
+
+
+@app.route("/api/plan", methods=["POST"])
+def api_plan():
+    """目标孔位排版：入参
+    {width, height, radius, folds, zones, targets: [{x, y} 原纸 mm, ...]}。
+    方案可用时返回 feasible=true 与打孔点/连带孔分组（供预览、确认后替换）；
+    不可实现时返回 feasible=false 与逐条违规/缺少连带孔原因（HTTP 200）；
+    入参结构或保护区本身不合法时返回 400。
+    """
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return _bad("请求不是合法 JSON")
+    try:
+        return jsonify(plan_lookup(payload))
     except ValueError as exc:
         return _bad(str(exc))
 

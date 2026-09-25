@@ -13,4 +13,5 @@ services:
       MAX_FOLDS: "${MAX_FOLDS:-8}"
       MAX_HOLES: "${MAX_HOLES:-24}"
       MAX_ZONES: "${MAX_ZONES:-8}"
+      MAX_TARGETS: "${MAX_TARGETS:-6144}"
     restart: unless-stopped

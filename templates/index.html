@@ -41,6 +41,12 @@
     border-radius:6px; font-size:14px;
   }
   input[type=number]:focus { outline:2px solid #bfdbfe; border-color:var(--blue); }
+  textarea {
+    width:100%; padding:6px 8px; border:1px solid var(--line);
+    border-radius:6px; font-size:13px; resize:vertical;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  textarea:focus { outline:2px solid #bfdbfe; border-color:var(--blue); }
   .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
   .row3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; }
   .row4 { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; }
@@ -111,7 +117,7 @@
   }
   .status {
     margin-top:10px; border-radius:6px; padding:8px 10px; font-size:12.5px;
-    border:1px solid transparent; display:none;
+    border:1px solid transparent; display:none; white-space:pre-line;
   }
   .status.show { display:block; }
   .status.err { background:#fef2f2; border-color:#fecaca; color:#991b1b; }
@@ -129,7 +135,7 @@
 <body>
 <header>
   <h1>纸张对折打孔 · 展开预览</h1>
-  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图。</p>
+  <p>设定纸张与折法 → 在最终折叠面上点击打孔（或开启「反查打孔」直接在展开图上点目标孔心，或在左侧「目标孔位排版」逐行录入目标孔心自动生成方案）→ 系统按折叠顺序逆推全部孔位（坐标单位 mm，原点在纸面左下角）。可划定原纸保护区，孔圆触碰保护区即禁止生成展开图。</p>
 </header>
 
 <div class="layout">
@@ -200,6 +206,18 @@
     <ol class="folds" id="zoneList"></ol>
     <p class="empty" id="zoneEmpty">尚未设置保护区。</p>
 
+    <h2 style="margin-top:16px">目标孔位排版</h2>
+    <p class="hint">按原纸 mm 坐标逐行输入目标孔心（每行「x y」或「x, y」）。
+      系统把每个目标折回折叠面再展开为完整连带孔组：仅当连带孔集合与目标
+      集合完全一致、打孔点不超上限且通过边界/折痕/保护区校验时才生成可用
+      方案，否则指出缺少的连带孔或违规目标及原因。</p>
+    <textarea id="planTargets" rows="5" spellcheck="false"
+      placeholder="52.5 74.25&#10;157.5 74.25"></textarea>
+    <div class="toolbar" style="margin-top:6px">
+      <button type="button" id="btnPlan" class="primary">生成排版方案</button>
+      <button type="button" id="btnPlanClear">清空</button>
+    </div>
+
     <div class="status" id="status"></div>
   </section>
 
@@ -244,6 +262,11 @@
         <button type="button" id="btnCancelReverse">取消</button>
         <span class="hint" id="reverseInfo"></span>
       </div>
+      <div class="toolbar" id="planBar" style="display:none">
+        <button type="button" id="btnConfirmPlan" class="primary">确认：替换当前打孔点</button>
+        <button type="button" id="btnCancelPlan">取消</button>
+        <span class="hint" id="planInfo"></span>
+      </div>
     </section>
   </div>
 </div>
@@ -254,6 +277,7 @@
   var MAX_FOLDS = {{ max_folds }};
   var MAX_HOLES = {{ max_holes }};
   var MAX_ZONES = {{ max_zones }};
+  var MAX_TARGETS = {{ max_targets }};
   var DELETE_PICK_MM = 2.0;      // 点击距已有孔小于该值则删除
   var CLICK_TOL_NORM = 0.004;    // 归一化点击越界容差
 
@@ -280,6 +304,10 @@
   var pending = null;   // 待确认的反查结果（/api/reverse 返回）
   var revSeq = 0;       // 反查请求序号；纸张/半径/折法一变即作废旧响应
 
+  // 目标孔位排版：逐行录入原纸目标孔心，服务端生成折叠面打孔方案
+  var planPreview = null;   // 待确认的排版方案（/api/plan 返回）
+  var planSeq = 0;          // 排版请求序号；纸张/半径/折法/保护区一变即作废
+
   var $ = function (id) { return document.getElementById(id); };
 
   // ---------------- 渲染：折叠顺序列表 ----------------
@@ -297,6 +325,7 @@
       del.addEventListener("click", function () {
         state.folds.splice(i, 1);
         clearPending();
+        clearPlan();
         renderFoldList();
         schedule(true);
       });
@@ -340,6 +369,7 @@
       del.addEventListener("click", function () {
         state.zones.splice(i, 1);
         clearPending();
+        clearPlan();
         renderZoneList();
         schedule(true);
       });
@@ -407,13 +437,11 @@
     if (d.error) {
       wrap.innerHTML = '<span class="placeholder">存在不合法项，暂不生成展开图</span>';
       $("holeMeta").textContent = "";
-      $("btnDownload").disabled = true;
       $("downloadHint").textContent = "";
       setStatus("err", d.error);
     } else {
       renderUnfolded();
       $("holeMeta").textContent = state.width + " × " + state.height + " mm";
-      $("btnDownload").disabled = false;
       var merged = d.holeCount < d.expectedCount;
       $("downloadHint").textContent = merged
         ? "存在重合孔位，已自动只画一次。" : "";
@@ -423,10 +451,22 @@
       setStatus("ok", msg);
     }
     $("holeCountLabel").textContent = state.points.length + " / " + MAX_HOLES;
+    updateDownloadBtn();
+  }
+
+  // 排版方案预览期间禁止下载（视图显示的是方案，不是当前打孔点）
+  function updateDownloadBtn() {
+    $("btnDownload").disabled =
+      !!planPreview || !lastResult || !!lastResult.error;
   }
 
   // 折叠面重绘（含反查预览标记）
   function renderFolded() {
+    if (planPreview && planPreview.foldedSvg) {
+      // 排版预览：展示方案折叠面（静态，不绑定点击）
+      $("foldedSvgWrap").innerHTML = planPreview.foldedSvg;
+      return;
+    }
     if (!lastResult) return;
     var f = lastResult.folded;
     $("foldedSvgWrap").innerHTML = f.svg;
@@ -437,6 +477,11 @@
   // 展开图重绘（含反查预览高亮）
   function renderUnfolded() {
     var wrap = $("unfoldedSvgWrap");
+    if (planPreview && planPreview.unfoldedSvg) {
+      // 排版预览：展示方案展开结果（静态，不绑定点击）
+      wrap.innerHTML = planPreview.unfoldedSvg;
+      return;
+    }
     if (!lastResult || lastResult.error) {
       wrap.innerHTML = '<span class="placeholder">存在不合法项，暂不生成展开图</span>';
       return;
@@ -459,6 +504,7 @@
         var ey = state.points[i].y * f.height;
         if (Math.hypot(ex - pt.x, ey - pt.y) <= DELETE_PICK_MM) {
           state.points.splice(i, 1);
+          clearPlan();
           schedule(true);
           return;
         }
@@ -477,6 +523,7 @@
       nx = Math.min(1, Math.max(0, nx));
       ny = Math.min(1, Math.max(0, ny));
       state.points.push({ x: +nx.toFixed(6), y: +ny.toFixed(6) });
+      clearPlan();
       schedule(true);
     });
   }
@@ -530,6 +577,7 @@
   }
 
   function fetchReverse(pt) {
+    clearPlan();             // 新的反查预览取代排版方案预览
     var seq = ++revSeq;
     fetch("/api/reverse", {
       method: "POST",
@@ -635,6 +683,87 @@
     renderFolded();
   }
 
+  // ---------------- 目标孔位排版：逐行目标 → 方案预览 → 确认替换 ----------------
+  // 纸张、半径、折法或保护区变化时调用：作废旧方案并使进行中的响应失效
+  function clearPlan() {
+    planSeq++;
+    if (!planPreview) return;
+    planPreview = null;
+    updatePlanBar();
+    renderFolded();
+    renderUnfolded();
+  }
+
+  function updatePlanBar() {
+    var bar = $("planBar");
+    if (!planPreview) {
+      bar.style.display = "none";
+      $("planInfo").textContent = "";
+      updateDownloadBtn();
+      return;
+    }
+    bar.style.display = "flex";
+    $("planInfo").textContent = "排版预览：" + planPreview.pointCount +
+      " 个打孔点 → " + planPreview.holeCount + " 个孔（目标 " +
+      planPreview.targetCount + " 个）";
+    $("btnConfirmPlan").disabled = !planPreview.feasible;
+    updateDownloadBtn();
+  }
+
+  // 逐行解析「x y」或「x, y」（原纸 mm），返回 {targets} 或 {error}
+  function parseTargets() {
+    var lines = $("planTargets").value.split("\n");
+    var targets = [];
+    for (var i = 0; i < lines.length; i++) {
+      var s = lines[i].trim();
+      if (!s) continue;
+      var parts = s.split(/[\s,，、;；]+/).filter(function (p) { return p !== ""; });
+      if (parts.length !== 2) {
+        return { error: "第 " + (i + 1) + " 行格式错误：每行需两个数字（x y，原纸 mm）。" };
+      }
+      var x = parseFloat(parts[0]), y = parseFloat(parts[1]);
+      if (!isFinite(x) || !isFinite(y)) {
+        return { error: "第 " + (i + 1) + " 行含无效数字，请检查。" };
+      }
+      targets.push({ x: +x.toFixed(6), y: +y.toFixed(6) });
+    }
+    if (!targets.length) return { error: "请至少输入一个目标孔心。" };
+    if (targets.length > MAX_TARGETS) {
+      return { error: "目标孔心数量超过上限 " + MAX_TARGETS + " 个。" };
+    }
+    return { targets: targets };
+  }
+
+  // 不可实现时的明细：违规目标及原因 / 缺少的连带孔 / 打孔点超限
+  function planProblemText(d) {
+    var lines = [];
+    if (d.violations && d.violations.length) {
+      lines.push("违规目标 " + d.violations.length + " 个（无法落位）：");
+      d.violations.slice(0, 5).forEach(function (v) {
+        lines.push("· 目标 #" + (v.index + 1) + " (" + v.target.x + ", " +
+          v.target.y + ")：" + v.reason);
+      });
+      if (d.violations.length > 5) {
+        lines.push("· …另有 " + (d.violations.length - 5) + " 个，从略。");
+      }
+    }
+    if (d.missing && d.missing.length) {
+      lines.push("缺少连带孔 " + d.missing.length +
+        " 个（按当前折法打孔会额外带出，但未在目标列表中）：");
+      d.missing.slice(0, 5).forEach(function (m) {
+        lines.push("· (" + m.x + ", " + m.y + ")");
+      });
+      if (d.missing.length > 5) {
+        lines.push("· …另有 " + (d.missing.length - 5) + " 个，从略。");
+      }
+    }
+    if (d.pointCount > d.maxHoles) {
+      lines.push("方案需要 " + d.pointCount + " 个打孔点，超过上限 " +
+        d.maxHoles + " 个。");
+    }
+    return lines.join("\n") || d.error || "目标集合不可实现。";
+  }
+
   // ---------------- 控件绑定 ----------------
   function readInputs() {
     var w = parseFloat($("inW").value), h = parseFloat($("inH").value),
@@ -651,9 +780,10 @@
     $(id).addEventListener("input", function () {
       var pw = state.width, ph = state.height, pr = state.radius;
       if (readInputs()) {
-        // 纸张或半径一变，待确认的反查预览即失效
+        // 纸张或半径一变，待确认的反查预览与排版方案即失效
         if (pw !== state.width || ph !== state.height || pr !== state.radius) {
           clearPending();
+          clearPlan();
         }
         renderZoneList();   // 纸张改小可能使保护区越界，即时标红提示修正
         schedule(false);
@@ -666,6 +796,7 @@
       if (state.folds.length >= MAX_FOLDS) return;
       state.folds.push(b.getAttribute("data-add"));
       clearPending();
+      clearPlan();
       renderFoldList();
       schedule(true);
     });
@@ -675,6 +806,7 @@
     if (!state.folds.length) return;
     state.folds.pop();
     clearPending();
+    clearPlan();
     renderFoldList();
     schedule(true);
   });
@@ -682,11 +814,13 @@
     if (!state.folds.length) return;
     state.folds = [];
     clearPending();
+    clearPlan();
     renderFoldList();
     schedule(true);
   });
   $("btnClearHoles").addEventListener("click", function () {
     state.points = [];
+    clearPlan();
     schedule(true);
   });
 
@@ -715,6 +849,7 @@
     }
     state.zones.push(z);
     clearPending();          // 待确认的反查结果按旧保护区判定，作废
+    clearPlan();             // 排版方案同样作废
     renderZoneList();
     schedule(true);
   });
@@ -723,6 +858,7 @@
     if (!state.zones.length) return;
     state.zones = [];
     clearPending();
+    clearPlan();
     renderZoneList();
     schedule(true);
   });
@@ -734,7 +870,10 @@
       if (p === "a4") { state.width = 210; state.height = 297; }
       if (p === "a4l") { state.width = 297; state.height = 210; }
       if (p === "square") { state.width = 200; state.height = 200; }
-      if (pw !== state.width || ph !== state.height) clearPending();
+      if (pw !== state.width || ph !== state.height) {
+        clearPending();
+        clearPlan();
+      }
       $("inW").value = state.width; $("inH").value = state.height;
       renderZoneList();
       schedule(true);
@@ -751,6 +890,7 @@
         "并高亮本次打孔必然生成的全部孔位；确认后才加入现有打孔点。"
       : "";
     clearPending();
+    clearPlan();           // 反查点击需要可交互的展开图，关闭排版预览
     renderUnfolded();
   });
 
@@ -762,17 +902,78 @@
       return;
     }
     // 与在折叠面直接点击完全等价：加入归一化孔心，走现有展开/下载流程
-    state.points.push({
-      x: +pending.center.x.toFixed(6),
-      y: +pending.center.y.toFixed(6)
-    });
+    //（center 为服务端全精度值，不再二次舍入，避免重算时越过边界容差）
+    state.points.push({ x: pending.center.x, y: pending.center.y });
     pending = null;
     updateReverseBar();
+    clearPlan();
     schedule(true);
   });
 
   $("btnCancelReverse").addEventListener("click", function () {
     clearPending();
+    setStatus("", "");
+  });
+
+  // ---------------- 目标孔位排版：生成 / 确认 / 取消 ----------------
+  $("btnPlan").addEventListener("click", function () {
+    var parsed = parseTargets();
+    if (parsed.error) { setStatus("warn", parsed.error); return; }
+    clearPending();              // 与反查待确认预览互斥
+    var seq = ++planSeq;
+    fetch("/api/plan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        width: state.width, height: state.height, radius: state.radius,
+        folds: state.folds, zones: state.zones, targets: parsed.targets
+      })
+    }).then(function (resp) {
+      return resp.json().then(function (data) { return { ok: resp.ok, data: data }; });
+    }).then(function (r) {
+      if (seq !== planSeq) return;   // 参数已变或已有更新的请求，丢弃
+      if (!r.data || r.data.ok !== true) {
+        planPreview = null;
+        updatePlanBar();
+        renderFolded();
+        renderUnfolded();
+        setStatus("err", (r.data && r.data.error) || "排版失败：服务器返回异常。");
+        return;
+      }
+      planPreview = r.data;
+      updatePlanBar();
+      renderFolded();
+      renderUnfolded();
+      if (planPreview.feasible) {
+        setStatus("ok", "方案可行：" + planPreview.pointCount + " 个打孔点 → " +
+          planPreview.holeCount + " 个孔，连带孔集合与目标集合完全一致。" +
+          "确认后将以方案替换当前打孔点（仍走现有展开与下载校验）。");
+      } else {
+        setStatus("err", planProblemText(planPreview));
+      }
+    }).catch(function () {
+      if (seq !== planSeq) return;
+      setStatus("err", "网络错误：无法连接计算服务。");
+    });
+  });
+
+  $("btnPlanClear").addEventListener("click", function () {
+    $("planTargets").value = "";
+  });
+
+  $("btnConfirmPlan").addEventListener("click", function () {
+    if (!planPreview || !planPreview.feasible) return;
+    // 以方案替换当前打孔点（归一化孔心由服务端给出，保留精度），
+    // 随后照常走 /api/unfold 展开与下载校验
+    state.points = planPreview.points.map(function (p) {
+      return { x: p.x, y: p.y };
+    });
+    clearPlan();
+    schedule(true);
+  });
+
+  $("btnCancelPlan").addEventListener("click", function () {
+    clearPlan();
     setStatus("", "");
   });
 

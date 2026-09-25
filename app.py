@@ -16,6 +16,10 @@
   中线镜像），逐层折回最终折叠面，得到归一化孔心；再用同一展开算法列出
   这一次打孔必然生成的全部孔位。目标孔心距纸张边界/折痕不大于打孔半径时
   拒绝并说明具体原因。
+- 目标孔位排版：把原纸上的一批目标孔心分别折回最终折叠面（多目标可折到
+  同一打孔点），再展开为完整连带孔组并按坐标容差去重。只有连带孔集合与
+  目标集合完全一致、方案打孔点数不超过 MAX_HOLES 且通过边界/折痕/保护区
+  校验时才返回可用方案；不可实现时指出缺少的连带孔或违规目标及原因。
 - 全部折痕展开后构成 (2^nv - 1) x (2^nh - 1) 的等分网格。
 - 原纸保护区：原纸上至多 MAX_ZONES 个轴对齐矩形（mm 坐标），绘入展开图。
   任一展开孔圆与任一保护区相交或相切即违规：指出原打孔点、触碰的展开孔
@@ -38,11 +42,16 @@ app = Flask(__name__)
 MAX_FOLDS = int(os.environ.get("MAX_FOLDS", "8"))
 MAX_HOLES = int(os.environ.get("MAX_HOLES", "24"))
 MAX_ZONES = int(os.environ.get("MAX_ZONES", "8"))
+# 单次排版的目标孔心上限，默认与「打孔点上限 × 单点最多展开孔数」一致
+MAX_TARGETS = int(os.environ.get(
+    "MAX_TARGETS", str(MAX_HOLES * 2 ** MAX_FOLDS)))
 MIN_DIM = 20.0          # mm
 MAX_DIM = 2000.0        # mm
 MIN_RADIUS = 0.5        # mm
 MAX_RADIUS = 50.0       # mm
 EDGE_TOL = 0.05         # mm，边界判定容差（浮点误差 + 必须严格在内侧）
+ROUND_TRIP_TOL = 1e-6   # mm，归一化坐标往返（mm -> 归一化 -> mm）的浮点误差宽限：
+                        # 反查/排版给出的孔心确认后重算时，不被同一校验误拒
 
 ALLOWED_FOLDS = ("vL", "vR", "hT", "hB")
 EDGE_NAMES = {
@@ -141,18 +150,81 @@ def fold_point_to_face(tx, ty, folds, width, height):
 
 
 def dedupe_points(points, tol=1e-5):
-    """按物理 mm 坐标去重（重合位置只保留一个）。"""
+    """按物理 mm 坐标去重（重合位置只保留一个）。
+
+    用 tol 网格索引加速：距离不超过 tol 的两点必落在相邻九宫格内，
+    判定结果与逐对比较一致，但排版场景（数千个孔）不至于平方级耗时。
+    """
+    cells = {}
     out = []
     for x, y in points:
-        if any(abs(x - q[0]) <= tol and abs(y - q[1]) <= tol for q in out):
+        cx, cy = math.floor(x / tol), math.floor(y / tol)
+        dup = False
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                for qx, qy in cells.get((ix, iy), ()):
+                    if abs(x - qx) <= tol and abs(y - qy) <= tol:
+                        dup = True
+                        break
+                if dup:
+                    break
+            if dup:
+                break
+        if dup:
             continue
+        cells.setdefault((cx, cy), []).append((x, y))
         out.append((x, y))
     return [{"x": round(x, 6), "y": round(y, 6)} for x, y in out]
 
 
+def point_set_membership(points, tol=1e-5):
+    """把点集按 tol 网格索引，返回成员判定函数（|dx|、|dy| 均不超过 tol）。"""
+    cells = {}
+    for x, y in points:
+        key = (math.floor(x / tol), math.floor(y / tol))
+        cells.setdefault(key, []).append((x, y))
+
+    def contains(px, py):
+        cx, cy = math.floor(px / tol), math.floor(py / tol)
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                for qx, qy in cells.get((ix, iy), ()):
+                    if abs(px - qx) <= tol and abs(py - qy) <= tol:
+                        return True
+        return False
+
+    return contains
+
+
+def dedupe_with_index(points, tol=1e-5):
+    """按物理 mm 坐标去重，返回 (唯一点列表, 原点下标 -> 唯一点下标)。"""
+    cells = {}
+    uniq = []
+    index = []
+    for x, y in points:
+        cx, cy = math.floor(x / tol), math.floor(y / tol)
+        found = -1
+        for ix in (cx - 1, cx, cx + 1):
+            for iy in (cy - 1, cy, cy + 1):
+                for gi, (qx, qy) in cells.get((ix, iy), ()):
+                    if abs(x - qx) <= tol and abs(y - qy) <= tol:
+                        found = gi
+                        break
+                if found >= 0:
+                    break
+            if found >= 0:
+                break
+        if found < 0:
+            found = len(uniq)
+            uniq.append((x, y))
+            cells.setdefault((cx, cy), []).append((found, (x, y)))
+        index.append(found)
+    return uniq, index
+
+
 def check_point(px, py, w, h, radius, edges):
     """校验单个打孔点，返回中文错误信息；合法返回 None。"""
-    r = radius + EDGE_TOL
+    r = radius + EDGE_TOL - ROUND_TRIP_TOL
     checks = (("x0", px), ("x1", w - px), ("y0", py), ("y1", h - py))
     for key, dist in checks:
         if dist < r:
@@ -559,12 +631,165 @@ def reverse_lookup(payload):
     return {
         "ok": True,
         "target": {"x": round(tx, 6), "y": round(ty, 6)},
-        "center": {"x": round(fx / w, 6), "y": round(fy / h, 6)},
+        # center 不额外舍入：确认加入后重算时不因舍入越过边界容差
+        "center": {"x": fx / w, "y": fy / h},
         "centerMm": {"x": round(fx, 6), "y": round(fy, 6)},
         "foldedWidth": round(w, 6),
         "foldedHeight": round(h, 6),
         "holes": holes,
         "holeCount": len(holes),
+    }
+
+
+def plan_layout(payload):
+    """目标孔位排版：原纸目标孔心集合 -> 折叠面打孔方案。
+
+    每个目标先折回最终折叠面、再展开为完整连带孔组；全部连带孔按坐标
+    容差去重后与目标集合比对。只有二者完全一致、方案打孔点数不超过
+    MAX_HOLES 且通过边界/折痕/保护区校验时才可行；否则指出缺少的
+    连带孔或违规目标及原因。存在违规目标时不给出预览（部分方案会误导）。
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+
+    width, height, radius, folds = _validate_sheet(payload)
+    zones = _validate_zones(payload)
+
+    targets = payload.get("targets")
+    if not isinstance(targets, list) or not targets:
+        raise ValueError("缺少目标孔心 targets（原纸 mm 坐标的非空数组）")
+    if len(targets) > MAX_TARGETS:
+        raise ValueError(f"目标孔心数量须为 1 ~ {MAX_TARGETS} 个")
+    norm_targets = []
+    for i, t in enumerate(targets):
+        if not isinstance(t, dict):
+            raise ValueError(f"目标孔心 #{i + 1} 格式错误")
+        norm_targets.append(
+            {"x": _num(t, "x", 0.0, MAX_DIM, f"目标孔心 #{i + 1} 的 x"),
+             "y": _num(t, "y", 0.0, MAX_DIM, f"目标孔心 #{i + 1} 的 y")})
+
+    w, h, edges, nv, nh = folded_state(width, height, folds)
+    _check_face_capacity(w, h, radius)
+
+    # 保护区必须完整位于原纸内
+    oob = zone_out_of_bounds(zones, width, height)
+    if oob is not None:
+        raise ValueError(zone_bounds_msg(oob, zones[oob], width, height))
+
+    n_images = 2 ** len(folds)
+    violations = []
+    folded = []      # 通过边界/折痕校验的目标：(下标, 原纸 x, 原纸 y, 面 x, 面 y)
+
+    for i, t in enumerate(norm_targets):
+        tx, ty = t["x"], t["y"]
+        reason = None
+        if tx > width + EDGE_TOL or ty > height + EDGE_TOL:
+            reason = (f"目标孔心 ({tx:.2f}, {ty:.2f}) 超出原纸 "
+                      f"{width:g} × {height:g}mm 的范围，请修正坐标。")
+        if reason is None:
+            # 目标孔心在原纸上的校验（边界 + 全部折痕）
+            reason = check_target_on_paper(tx, ty, width, height, radius, nv, nh)
+        fx = fy = None
+        if reason is None:
+            fx, fy = fold_point_to_face(tx, ty, folds, width, height)
+            # 折回折叠面后的校验（与上面的校验几何等价，作浮点兜底）
+            err = check_point(fx, fy, w, h, radius, edges)
+            if err:
+                reason = f"折回折叠面后{err}"
+        if reason is not None:
+            violations.append({"index": i,
+                               "target": {"x": round(tx, 6), "y": round(ty, 6)},
+                               "reason": reason})
+        else:
+            folded.append((i, tx, ty, fx, fy))
+
+    # 折回后的打孔点按坐标容差去重（折叠排版中大量目标共享同一打孔点），
+    # 之后每个唯一打孔点只展开一次，避免逐目标展开的平方级开销
+    uniq_face, face_of = dedupe_with_index([(fx, fy) for _, _, _, fx, fy
+                                            in folded])
+    face_dedup = [{"x": round(x, 6), "y": round(y, 6)} for x, y in uniq_face]
+    too_many = len(uniq_face) > MAX_HOLES
+
+    groups = []      # 每个唯一打孔点的完整连带孔组（未去重）
+    if not too_many:
+        # 打孔点超限时不再展开：方案必然不可用，且避免产生超限的巨型结果
+        for fx, fy in uniq_face:
+            groups.append(unfold_points([{"x": fx, "y": fy}],
+                                        folds, width, height))
+        if zones:
+            # 与折叠面打孔同一判定：任一连带孔圆触碰保护区即违规；
+            # 共享同一打孔点的目标一并判违规
+            hit_by_group = {}
+            for gi, raw in enumerate(groups):
+                hit = find_zone_hit(raw, zones, radius, n_images)
+                if hit:
+                    hit_by_group[gi] = hit
+            for k, (i, tx, ty, _, _) in enumerate(folded):
+                hit = hit_by_group.get(face_of[k])
+                if hit:
+                    _, hole, zi = hit
+                    violations.append({
+                        "index": i,
+                        "target": {"x": round(tx, 6), "y": round(ty, 6)},
+                        "reason": zone_hit_msg(
+                            f"目标 #{i + 1}（原纸 ({tx:.2f}, {ty:.2f})mm）",
+                            hole["x"], hole["y"], zi, zones[zi], radius)})
+            violations.sort(key=lambda v: v["index"])
+
+    feasible = False
+    holes, missing, points = [], [], []
+    folded_svg = unfolded_svg = None
+    error = None
+
+    if violations:
+        error = (f"{len(violations)} 个目标孔心违规"
+                 f"（首个：{violations[0]['reason']}）")
+        if too_many:
+            error += (f"；且方案需要 {len(uniq_face)} 个打孔点，"
+                      f"超过上限 {MAX_HOLES} 个")
+        error += "，方案不可用。"
+    elif too_many:
+        error = (f"方案需要 {len(uniq_face)} 个打孔点，"
+                 f"超过上限 {MAX_HOLES} 个，方案不可用。")
+    else:
+        # 连带孔并集，按坐标容差去重
+        holes = dedupe_points(pt for g in groups for pt in g)
+
+        # 缺少的连带孔：必然会被打出、却未出现在目标集合中的孔位
+        in_targets = point_set_membership(
+            [(t["x"], t["y"]) for t in norm_targets])
+        missing = [hp for hp in holes if not in_targets(hp["x"], hp["y"])]
+        feasible = not missing
+
+        # 归一化坐标不额外舍入（JSON 双精度往返无损）：确认替换后重算时
+        # 不会因舍入越过边界容差（check_point 另有 ROUND_TRIP_TOL 宽限兜底）
+        points = [{"x": p["x"] / w, "y": p["y"] / h} for p in face_dedup]
+        folded_svg = build_folded_svg(w, h, edges, face_dedup, radius, -1)[0]
+        unfolded_svg = build_unfolded_svg(
+            width, height, holes, crease_grid(width, height, nv, nh),
+            radius, nv, nh, zones)
+
+        if missing:
+            error = (f"按当前折法会额外带出 {len(missing)} 个连带孔"
+                     f"（如 ({missing[0]['x']:g}, {missing[0]['y']:g})mm），"
+                     "未包含在目标列表中，方案不可用。")
+
+    return {
+        "ok": True,
+        "feasible": feasible,
+        "points": points,
+        "pointCount": len(face_dedup),
+        "maxHoles": MAX_HOLES,
+        "holes": holes,
+        "holeCount": len(holes),
+        "targetCount": len(norm_targets),
+        "missing": missing,
+        "violations": violations,
+        "foldedWidth": round(w, 6),
+        "foldedHeight": round(h, 6),
+        "foldedSvg": folded_svg,
+        "unfoldedSvg": unfolded_svg,
+        "error": error,
     }
 
 
@@ -576,6 +801,7 @@ def index():
     return render_template(
         "index.html",
         max_folds=MAX_FOLDS, max_holes=MAX_HOLES, max_zones=MAX_ZONES,
+        max_targets=MAX_TARGETS,
         min_dim=MIN_DIM, max_dim=MAX_DIM,
         min_radius=MIN_RADIUS, max_radius=MAX_RADIUS)
 
@@ -599,6 +825,19 @@ def api_reverse():
         return _bad("请求不是合法 JSON")
     try:
         return jsonify(reverse_lookup(payload))
+    except ValueError as exc:
+        return _bad(str(exc))
+
+
+@app.route("/api/plan", methods=["POST"])
+def api_plan():
+    """目标孔位排版：入参 {width, height, radius, folds, zones,
+    targets: [{x, y} 原纸 mm]}。"""
+    payload = request.get_json(force=True, silent=True)
+    if payload is None:
+        return _bad("请求不是合法 JSON")
+    try:
+        return jsonify(plan_layout(payload))
     except ValueError as exc:
         return _bad(str(exc))
 
